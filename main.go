@@ -1,66 +1,51 @@
+pi@raspberrypi:~/src $ cat main.go
 package main
 
 import (
     "bufio"
-    "encoding/json"
     "fmt"
     "log"
     "net/http"
+    "os"
     "os/exec"
     "sync"
+    "syscall"
+    "time"
+    "unsafe"
 )
 
-type Message struct {
-    Message string `json:"message"`
-}
-
-type MoveRequest struct {
-    Direction string `json:"direction"`
-}
+//////////////////////////////
+// Camera
+//////////////////////////////
 
 var (
-    latestFrame  []byte
-    frameMutex   sync.RWMutex
-    frameUpdated = make(chan struct{}, 1)
-
-    currentDirection = ""
-    isMoving        = false
+    latestFrame []byte
+    frameMutex  sync.RWMutex
 )
 
 func captureLoop() {
     cmd := exec.Command("bash", "-c", `
-        libcamera-vid -t 0 --inline --width 1280 --height 720 --framerate 24 --bitrate 4000000 --buffer-count 2 -o - |
-        ffmpeg -fflags nobuffer -flags low_delay -i - -q:v 2 -pix_fmt yuvj422p -f mjpeg pipe:1
+        libcamera-vid -t 0 --codec mjpeg --width 1280 --height 720 --framerate 24 -o -
     `)
-
     stdout, err := cmd.StdoutPipe()
     if err != nil {
         log.Fatal("Failed to get stdout pipe:", err)
     }
-
     if err := cmd.Start(); err != nil {
         log.Fatal("Failed to start capture process:", err)
     }
 
     reader := bufio.NewReader(stdout)
-
     for {
         frame, err := readNextJPEG(reader)
         if err != nil {
             log.Println("Error reading JPEG frame:", err)
             break
         }
-
         frameMutex.Lock()
         latestFrame = frame
         frameMutex.Unlock()
-
-        select {
-        case frameUpdated <- struct{}{}:
-        default:
-        }
     }
-
     cmd.Process.Kill()
 }
 
@@ -74,7 +59,6 @@ func readNextJPEG(reader *bufio.Reader) ([]byte, error) {
         return nil, fmt.Errorf("invalid JPEG start")
     }
     jpeg := append(startBytes, b2)
-
     for {
         b, err := reader.ReadByte()
         if err != nil {
@@ -91,171 +75,330 @@ func readNextJPEG(reader *bufio.Reader) ([]byte, error) {
 
 func streamMJPEG(w http.ResponseWriter, r *http.Request) {
     w.Header().Set("Content-Type", "multipart/x-mixed-replace; boundary=frame")
-
     for {
         select {
         case <-r.Context().Done():
             return
-        case <-frameUpdated:
+        default:
             frameMutex.RLock()
             frame := latestFrame
             frameMutex.RUnlock()
-
             if frame == nil {
+                time.Sleep(10 * time.Millisecond)
                 continue
             }
-
             _, err := fmt.Fprintf(w, "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n", len(frame))
             if err != nil {
                 return
             }
-
             if _, err := w.Write(frame); err != nil {
                 return
             }
-
             if _, err := fmt.Fprint(w, "\r\n"); err != nil {
                 return
             }
-
             if f, ok := w.(http.Flusher); ok {
                 f.Flush()
             }
+            time.Sleep(40 * time.Millisecond)
         }
     }
 }
 
-func pageMain(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "text/html; charset=utf-8")
-    fmt.Fprint(w, `
-<!DOCTYPE html>
+//////////////////////////////
+// Buzzer
+//////////////////////////////
+
+const (
+    gpioGetLineHandleIoctl  = 0xC16CB403
+    gpioHandleSetLineValues = 0xC040B409
+    gpioHandleRequestOutput = 0x2
+    GPIOHANDLES_MAX         = 64
+)
+
+type gpioHandleRequest struct {
+    LineOffsets   [GPIOHANDLES_MAX]uint32
+    Flags         uint32
+    DefaultValues [GPIOHANDLES_MAX]uint8
+    ConsumerLabel [32]byte
+    Lines         uint32
+    Fd            int32
+}
+
+type gpioHandleData struct {
+    Values [GPIOHANDLES_MAX]uint8
+}
+
+var (
+    buzzerFd    int32
+    buzzerMutex sync.Mutex
+    buzzerOn    bool
+)
+
+func initBuzzer(line uint32) {
+    chip := "/dev/gpiochip0"
+    f, err := os.OpenFile(chip, os.O_RDWR, 0)
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer f.Close()
+
+    var req gpioHandleRequest
+    req.LineOffsets[0] = line
+    req.Flags = gpioHandleRequestOutput
+    req.DefaultValues[0] = 0
+    req.Lines = 1
+
+    _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), gpioGetLineHandleIoctl, uintptr(unsafe.Pointer(&req)))
+    if errno != 0 {
+        log.Fatal(errno)
+    }
+    buzzerFd = req.Fd
+}
+
+func setBuzzer(value uint8) {
+    var data gpioHandleData
+    data.Values[0] = value
+    _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(buzzerFd), gpioHandleSetLineValues, uintptr(unsafe.Pointer(&data)))
+    if errno != 0 {
+        log.Println("ioctl error:", errno)
+    }
+}
+
+func buzzerToggle() {
+    buzzerMutex.Lock()
+    defer buzzerMutex.Unlock()
+
+    if buzzerOn {
+        // OFF
+        buzzerOn = false
+        setBuzzer(0)
+        return
+    }
+
+    // ON
+    buzzerOn = true
+    go func() {
+        frequency := 220
+        duty := 0.5
+        period := time.Second / time.Duration(frequency)
+        highTime := time.Duration(float64(period) * duty)
+        lowTime := period - highTime
+
+        for {
+            buzzerMutex.Lock()
+            on := buzzerOn
+            buzzerMutex.Unlock()
+            if !on {
+                setBuzzer(0)
+                return
+            }
+            setBuzzer(1)
+            time.Sleep(highTime)
+            setBuzzer(0)
+            time.Sleep(lowTime)
+        }
+    }()
+}
+
+//////////////////////////////
+// Flame sensor
+//////////////////////////////
+
+const (
+    GPIOHANDLE_REQUEST_INPUT           = 0x1
+    GPIOHANDLE_GET_LINE_VALUES_IOCTL   = 0xc040b408
+)
+
+type gpiohandleRequestInput struct {
+    LineOffsets   [64]uint32
+    Flags         uint32
+    DefaultValues [64]uint8
+    ConsumerLabel [32]byte
+    Lines         uint32
+    Fd            int32
+}
+
+var (
+    flameFd       int
+    flameDetected bool
+    flameMutex    sync.RWMutex
+)
+
+func initFlameSensor(pin uint32) {
+    chip := "/dev/gpiochip0"
+    fd, err := syscall.Open(chip, syscall.O_RDONLY, 0)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    var req gpiohandleRequestInput
+    req.LineOffsets[0] = pin
+    req.Flags = GPIOHANDLE_REQUEST_INPUT
+    req.Lines = 1
+    copy(req.ConsumerLabel[:], []byte("flame-sensor"))
+
+    _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), 0xc16cb403, uintptr(unsafe.Pointer(&req)))
+    if errno != 0 {
+        log.Fatal(errno)
+    }
+    flameFd = int(req.Fd)
+
+    go monitorFlame()
+}
+
+func monitorFlame() {
+    for {
+        var data struct{ Values [64]uint8 }
+        _, _, errno := syscall.Syscall(uintptr(syscall.SYS_IOCTL), uintptr(flameFd), uintptr(GPIOHANDLE_GET_LINE_VALUES_IOCTL), uintptr(unsafe.Pointer(&data)))
+        if errno != 0 {
+            log.Println("Failed reading flame sensor:", errno)
+        } else {
+            flameMutex.Lock()
+            //flameDetected = data.Values[0] == 0 // LOW = flame
+            flameDetected = data.Values[0] == 1 // HIGH = flame
+            flameMutex.Unlock()
+        }
+        time.Sleep(200 * time.Millisecond)
+    }
+}
+
+func flameStatusHandler(w http.ResponseWriter, r *http.Request) {
+    flameMutex.RLock()
+    detected := flameDetected
+    flameMutex.RUnlock()
+    if detected {
+        fmt.Fprint(w, "1")
+    } else {
+        fmt.Fprint(w, "0")
+    }
+}
+
+//////////////////////////////
+// HTTP Handlers
+//////////////////////////////
+
+func servePage(w http.ResponseWriter, r *http.Request) {
+    html := `<!DOCTYPE html>
 <html>
 <head>
-    <title>Arrow Key Control</title>
+<title>Robot Console</title>
+<style>
+body {
+    font-family: Arial, sans-serif;
+    background: #f0f2f5;
+    text-align: center;
+    padding: 20px;
+}
+h1 { color: #333; }
+
+#cam {
+    border: 2px solid #ccc;
+    border-radius: 8px;
+    width: 640px;
+    height: 360px;
+}
+
+.button {
+    padding: 15px 30px;
+    font-size: 18px;
+    margin: 20px;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: 0.3s;
+}
+
+#buzzerBtn { background-color: #007bff; color: white; }
+#buzzerBtn.active { background-color: #dc3545; }
+
+#flameStatus {
+    display: inline-block;
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    margin-left: 10px;
+    vertical-align: middle;
+}
+
+.card {
+    display: inline-block;
+    background: white;
+    padding: 20px;
+    border-radius: 10px;
+    box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+    margin: 10px;
+}
+</style>
 </head>
 <body>
-    <h1>Arrow Key Control Panel</h1>
-    <p>Use WASD keys to move. Diagonal supported.</p>
-    <pre id="result"></pre>
-    <img src="/cam" style="width: 640px; margin-top: 20px; border: 1px solid #333;">
+<h1>Robot Console</h1>
+
+<div class="card">
+    <h2>Camera</h2>
+    <img id="cam" src="/cam">
+</div>
+
+<div class="card">
+    <h2>Buzzer</h2>
+    <button id="buzzerBtn" class="button" onclick="toggleBuzzer()">ON/OFF</button>
+</div>
+
+<div class="card">
+    <h2>Flame Sensor</h2>
+    <span id="flameStatus"></span>
+    <span id="flameText"></span>
+</div>
+
 <script>
-    let up_push = false;
-    let down_push = false;
-    let left_push = false;
-    let right_push = false;
-    let lastSent = "";
+function toggleBuzzer() {
+    fetch('/buzzer/toggle').then(()=>{
+        let btn = document.getElementById('buzzerBtn');
+        btn.classList.toggle('active');
+    });
+}
 
-    document.addEventListener('keydown', (event) => {
-        switch(event.key){
-            case "w": up_push = true; break;
-            case "s": down_push = true; break;
-            case "a": left_push = true; break;
-            case "d": right_push = true; break;
+function updateFlame() {
+    fetch('/flame/status')
+    .then(r=>r.text())
+    .then(v=>{
+        let status = document.getElementById('flameStatus');
+        let text = document.getElementById('flameText');
+        if(v==='1') {
+            status.style.background='red';
+            text.textContent=' Flame Detected!';
+        } else {
+            status.style.background='green';
+            text.textContent=' No Flame';
         }
     });
+}
 
-    document.addEventListener('keyup', (event) => {
-        switch(event.key){
-            case "w": up_push = false; break;
-            case "s": down_push = false; break;
-            case "a": left_push = false; break;
-            case "d": right_push = false; break;
-        }
-    });
-
-    function getDirection() {
-        let dir = "";
-        if (up_push) dir += "w";
-        if (down_push) dir += "s";
-        if (left_push) dir += "a";
-        if (right_push) dir += "d";
-        return dir;
-    }
-
-    function loop() {
-        const dir = getDirection();
-        if (dir !== lastSent) {
-            lastSent = dir;
-            if (dir === "") {
-                fetch('/api/stop', { method: 'POST' })
-                .then(res => res.json())
-                .then(data => {
-                    document.getElementById('result').textContent = JSON.stringify(data, null, 2);
-                });
-            } else {
-                fetch('/api/move', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ direction: dir })
-                })
-                .then(res => res.json())
-                .then(data => {
-                    document.getElementById('result').textContent = JSON.stringify(data, null, 2);
-                });
-            }
-        }
-    }
-
-    setInterval(loop, 100);
+updateFlame();
+setInterval(updateFlame, 500);
 </script>
 </body>
-</html>
-`)
+</html>`
+    w.Header().Set("Content-Type", "text/html")
+    fmt.Fprint(w, html)
 }
 
-func apiMove(w http.ResponseWriter, r *http.Request) {
-    if r.Method != http.MethodPost {
-        http.Error(w, "Only POST is allowed", http.StatusMethodNotAllowed)
-        return
-    }
-
-    var req MoveRequest
-    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-        http.Error(w, "Invalid JSON", http.StatusBadRequest)
-        return
-    }
-
-    dir := req.Direction
-    directionMap := map[string]string{
-        "w":  "up",
-        "a":  "left",
-        "s":  "down",
-        "d":  "right",
-        "wa": "up-left",
-        "wd": "up-right",
-        "sa": "down-left",
-        "sd": "down-right",
-    }
-
-    if val, ok := directionMap[dir]; ok {
-        currentDirection = val
-        isMoving = true
-        fmt.Printf("Moving %s\n", val)
-        json.NewEncoder(w).Encode(Message{Message: "Moving " + val})
-    } else {
-        http.Error(w, "Invalid direction (use w/a/s/d or combinations like wa)", http.StatusBadRequest)
-    }
-}
-
-func apiStop(w http.ResponseWriter, r *http.Request) {
-    if r.Method != http.MethodPost {
-        http.Error(w, "Only POST is allowed", http.StatusMethodNotAllowed)
-        return
-    }
-
-    isMoving = false
-    currentDirection = ""
-    fmt.Println("Stopped")
-    json.NewEncoder(w).Encode(Message{Message: "Stopped"})
-}
+//////////////////////////////
+// Main
+//////////////////////////////
 
 func main() {
     go captureLoop()
+    initBuzzer(18)
+    initFlameSensor(17)
 
-    http.HandleFunc("/", pageMain)
+    http.HandleFunc("/", servePage)
     http.HandleFunc("/cam", streamMJPEG)
-    http.HandleFunc("/api/move", apiMove)
-    http.HandleFunc("/api/stop", apiStop)
+    http.HandleFunc("/buzzer/toggle", func(w http.ResponseWriter, r *http.Request) {
+        buzzerToggle()
+        fmt.Fprint(w, "Toggled")
+    })
+    http.HandleFunc("/flame/status", flameStatusHandler)
 
     log.Println("Server started at http://localhost:8080")
     log.Fatal(http.ListenAndServe(":8080", nil))
